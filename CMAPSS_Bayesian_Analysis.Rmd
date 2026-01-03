@@ -23,9 +23,9 @@ library(ggplot2)
 ## CMAPSS Data
 
 ```{r}
-fleet1 = read.delim("/Users/everestyoung/Desktop/Projects/RUL Turbofan/Bayesian Analysis/CMAPSSData/train_FD001.txt",sep = "",header = F) # train
+fleet1 = read.delim("/Users/.../Projects/RUL Turbofan/Bayesian Analysis/CMAPSSData/train_FD001.txt",sep = "",header = F) # train
 
-fleet1_test = read.delim("/Users/everestyoung/Desktop/Projects/RUL Turbofan/Bayesian Analysis/CMAPSSData/test_FD001.txt",sep = "",header = F) # test
+fleet1_test = read.delim("/Users/.../Projects/RUL Turbofan/Bayesian Analysis/CMAPSSData/test_FD001.txt",sep = "",header = F) # test
 ```
 
 \newpage
