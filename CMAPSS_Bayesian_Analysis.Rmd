@@ -1,0 +1,405 @@
+---
+title: "CMAPSS RUL Prediction Turbofan"
+output:
+  html_document:
+    df_print: paged
+date: "2025-07-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE, message = FALSE,cache = TRUE)
+```
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(stats)
+library(factoextra)
+library(brms) # bayesian 
+library(ggplot2)
+```
+
+## CMAPSS Data
+
+```{r}
+fleet1 = read.delim("/Users/everestyoung/Desktop/Projects/RUL Turbofan/Bayesian Analysis/CMAPSSData/train_FD001.txt",sep = "",header = F) # train
+
+fleet1_test = read.delim("/Users/everestyoung/Desktop/Projects/RUL Turbofan/Bayesian Analysis/CMAPSSData/test_FD001.txt",sep = "",header = F) # test
+```
+
+\newpage
+
+# Introduction
+
+CMAPSS Engine data simulates turbofan engines degradation of a randomly chosen initial detiortation set point. This variation is considered normal and is not considered a fault condition. The sensors and tools to measure this degradation process is based off of a thermal dynamical simulation model where we are measuring how temperature over a period of time (cycles) affect a turbofan engine. The simulation ran a multiple engines called fleet, until its failure point
+
+The dataset is very clean. Split by training and test data where in total 4 different fleets with different conditions (SEA LEVEL, etc) and different fault modes (HPC degradation or Fan degradation) of dataset in a .txt format is presented where we decided we will be analyzing the first fleet. That data consists of 100 train engines and 100 test engines and will show the \# of cycles and its sensory data mapping everything from the start of each engine simulation to the point of failure, while the test data consist of the start of engine simulation and stops at a few cycles before of the actual failure point. The specific fault mode for the first fleet data set is only HPC degradation. This means that the sensory data in the test set should degrade to a point where the model is able to start predicting the RUL for HPC degradation.
+
+The goal is can we predict the RUL of the test data given the training data?
+
+Data Set: FD001 Train trajectories: 100 Test trajectories: 100 Conditions: ONE (Sea Level) Fault Modes: ONE (HPC Degradation)
+
+Link: [CMAPSS Jet Engine Simulated Data](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data)
+
+Paper: [Damage Propagation Modeling for Aircraft Engine Prognostics](https://ntrs.nasa.gov/api/citations/20090029214/downloads/20090029214.pdf)
+
+Reference: A. Saxena, K. Goebel, D. Simon, and N. Eklund, ‘Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation’, in the Proceedings of the 1st International Conference on Prognostics and Health Management (PHM08), Denver CO, Oct 2008.
+
+\newpage
+
+### **Data Cleaning**
+
+#### Rename Dimensions
+
+```{r}
+rename_fleet = function(data){
+  data = rename(data,"engine_id" = "V1")
+  data = rename(data,"cycles" = "V2")
+  data = rename(data,"opsetting1" = "V3")
+  data = rename(data,"opsetting2" = "V4")
+  data = rename(data,"opsetting3" = "V5")
+  
+  var_name = "sensor"
+  sens_col = ncol(data) - 5
+  names(data)[6:26] = paste0(var_name,1:sens_col)
+  
+  return(data)
+}
+
+fleet1 = rename_fleet(data = fleet1)
+fleet1.t = rename_fleet(fleet1_test) # test
+```
+
+#### EDA
+
+```{r}
+summary(fleet1[c(-1,-4)]) 
+sum(is.na(fleet1)) # 0: no missing values
+fleet1 = fleet1 %>% select(!c("sensor18","sensor19")) # sensor 18 & 19 no predictive power, so drop
+```
+
+#### Create RUL dimension
+
+We are creating a Remaining useful life column as that will be the dependent column measuring & predicting RUL against our sensory data. The easiest way to calculate RUL is simply
+
+-   $RUL_i = max(cycles) - cycles_i$
+
+```{r}
+max_cycles = fleet1 %>% group_by(engine_id) %>% summarise(max_cycle = max(cycles))
+fleet1 = fleet1 %>% left_join(max_cycles, by = "engine_id") %>% mutate(RUL = max_cycle - cycles)
+```
+
+-   Due to our Weibull assumptions, which we will get to below, the response variable or RUL must be \>0. Therefore, we will just assign all RUL at 0 to be 0.01.
+
+```{r}
+fleet1$RUL = ifelse(fleet1$RUL == 0, 0.01, fleet1$RUL)
+vis.rul.df = fleet1 %>% filter(RUL == 0.01)
+ggplot(data = vis.rul.df, mapping = aes(x = cycles)) + geom_density() + theme_bw()
+```
+
+-   Visuals: We can observe that most engines RUL is around 200 cycles with exceptions \> 300 cycles and ones that fail at the beginning.
+
+#### PCA
+
+We utilize PCA because there are 26 sensors recording data at each cycle, which is far too many parameters for most models to handle without dimensionality reduction. Moreover, having too many dimensions often leads to multicollinearity.
+
+```{r}
+res.pca = prcomp(fleet1[,-c(1:5,25,26)],scale. = T, center = T)
+eig.val = get_eigenvalue(res.pca)
+plot(res.pca, type = "l", main = "pca results")
+```
+
+Based on our PCA results, we find that the first five components explain about 85% of the total variation. For this analysis, we therefore select the first five principal components. We also standardize the data (`scale = TRUE`) since the sensors measure different factors on very different scales. Standardization is essential for PCA and other analyses to ensure that all variables contribute appropriately.
+
+```{r}
+class(res.pca$x)
+res.pca.df = as.data.frame(res.pca$x)
+pca_df = res.pca.df[,1:5]
+fleet1_pca = cbind(fleet1[,c(1,2,26)],pca_df) # select engine id, cycles, RUL + PC1:5
+head(fleet1_pca)
+```
+
+Filter data and select only necessary variables and append PCA results to fleet1_pca table.
+
+\newpage
+
+**Bayesian Inference: Survival Analysis**
+
+The reason we conduct a Bayesian analysis rather than using deep learning or frequentist approaches such as LSTM or regression is that Bayesian methods allow us to obtain the full posterior distribution through Monte Carlo simulation. This, in turn, enables the calculation of credible intervals (uncertainty intervals), which differ from classical confidence intervals. Confidence intervals indicate that, under repeated sampling, the interval would contain the true parameter a certain proportion of the time. In contrast, a credible interval states directly that the true parameter lies within the interval with a given probability. This distinction is important in real-world applications, where decisions must account for risk rather than relying solely on point predictions.
+
+Another advantage of the Bayesian Weibull model is that it allows us to incorporate domain knowledge through informative priors, such as constraints on the hazard shape or expectations about the effects of specific sensors. This improves data efficiency, which is especially valuable when the number of engines is limited relative to the number of sensor features. Finally, Bayesian analysis supports risk based decision making by enabling probabilistic queries on the posterior distribution. For example, we can ask: What is the probability that this engine has fewer than 20 cycles of life remaining? $P(RUL < 20)$, or What is the probability that this engine has more than 10 but fewer than 20 cycles of RUL? = $P(RUL > 10 \wedge RUL < 20)$?
+
+Weibull assumptions:
+
+1.  Weibull distribution assumes RUL \> 0, or non zero value
+
+```{r, eval = F}
+fleet1_pca$RUL = ifelse(fleet1_pca$RUL == 0, 0.01, fleet1_pca$RUL)
+```
+
+2.  Weibull distribution assumes that the RUL dimensions follows a weibull distribution since hazard functions follow a monotonic function. This is true given time increases, higher chance of hazard risk
+
+3.  Independence among each engine failures
+
+Since Weibull's domain is x \> 0, we will instead treat RUL at 0 = 0.01. The Weibull survival distribution follows:
+
+-   Shape: $k = 1/\sigma$, where we can model infant mortality if $k < 1$, constant hazard $k = 1$, or increasing hazard (wear out)
+-   Scale: $\lambda = exp(\mu + \beta^{T}x)$, where this our baseline and our covariates determining how to scale our functions. Larger the scale, the more spread out the distribution will be.
+
+Where ultimately,
+
+-   Survival function: $S(t|x) = exp(-(\frac{t}{\lambda})^{k})$
+-   Hazard function: $h(t|x) = \frac{k}{\lambda}(\frac{t}{k})^{k-1}$
+
+We will then be choosing the AFT model, which helps create a regression model for our RUL analysis. The AFT Weibull model follows:
+
+$log(T_i) = \mu + \beta^{T}x + \epsilon,$ where
+
+\- $T_i \approx Weibull(k = \frac{1}{\sigma}, \lambda_i = exp(\mu + \beta^{T}x_i)$ & Time until failure
+
+\- $x =$ covariates (PC1 \~ PC5 sensors)
+
+\- \$\beta\$ regression coefficients
+
+\- \$\epsilon\$ error
+
+The library we will be using to create a model will be the brms: brm function.
+
+In this model, we specify a prior with the following distributions:
+
+\- $\beta_j = Normal(0,0.35)$
+
+\- $\mu = Normal(log(120),0.5)$
+
+\- $k = lognormal(log(1.7),0.3)$
+
+```{r}
+model.choice = function(fc,linear = "linear"){
+    weibull.m = brm(
+    formula = if(linear == "nonlinear") {
+        bf(RUL | cens(0) ~ s(cycles) + PC1 + PC2 + PC3 + PC4 + PC5)
+      }else{
+        bf(RUL | cens(0) ~ cycles + PC1 + PC2 + PC3 + PC4 + PC5)
+      }, # cens(0) uncensored response 
+    data = fleet1_pca,
+    family = fc,
+    prior = c(
+      prior(normal(0, 0.35),class = "b"),                 # more shrinkage on betas
+      prior(normal(log(120), 0.5),class = "Intercept"),        # tighter intercept on log(scale)
+      prior(lognormal(log(1.7), 0.3), class = "shape")               # positive prior for Weibull shape (rate=1)
+      # alternatives for shape:
+      # prior(exponential(1), class="shape")
+      # prior(lognormal(log(1.5), 0.5), class="shape")
+    ),
+    chain = 4,
+    iter = 6000,
+    warmup = 3000,
+    cores = 6,
+    sample_prior = "yes",
+    control = list(adapt_delta = 0.99, max_treedepth = 15)# HMC parameter, acceptance parameter change
+  ) 
+}
+
+# weibull model
+weibull.m = model.choice(weibull())
+# weibull.nonlin.m = model.choice(weibull(), "nonlinear")
+# lognormal model
+lognormal.m = model.choice(lognormal())
+```
+
+```{r}
+summary(weibull.m)
+```
+
+Based on the model, we focus on the following points:
+
+-   **Convergence**: The $\hat{R}$ = 1.00 meaning the chains mixed well and all x of your chains agree to a posterior. However,the $\hat{R}$ alone is not sufficient; we also evaluate the effective sample size (ESS), which tells us how many of the MCMC samples can be considered approximately independent. Because MCMC samples are autocorrelated within chains, low ESS can lead to unreliable estimates of means, variances, and intervals. A larger ESS indicates greater reliability of the posterior estimates. In this case, both the bulk ESS (main body of the posterior) and the tail ESS (covering the 2.5% and 97.5% quantiles) are very high, confirming strong convergence and precision.
+-   **Coefficients**
+    -   Intercept: Estimated at 4.68, which corresponds to exp(4.68) ≈107.8 cycles when all covariates are zero.
+    -   Cycles: Coefficient ≈ 0, indicating no practical effect.
+    -   PC1–PC5: Each one unit increase in a covariate with a positive coefficient increases RUL, while negative coefficients decrease RUL.
+    -   Shape: k=2.43, with k\>1, indicates an increasing hazard rate consistent with a wear out failure regime.
+
+If necessary, we can drop PC2 from our model following the law of parsimony.
+
+\newpage
+
+### Compare Weibull and Lognormal family
+
+```{r, message = F}
+#pp_check(weibull.nonlin.m, type = "dens_overlay")
+pp_check(weibull.m, type = "dens_overlay") # we can see the overlay of the predicted to y has some distinct features
+pp_check(weibull.m, type = "ecdf_overlay")
+pp_check(lognormal.m, type = "dens_overlay")
+pp_check(lognormal.m, type = "ecdf_overlay")
+```
+
+```{r}
+weib_m = add_criterion(weibull.m,"loo",moment_match = T)
+logn_m = add_criterion(lognormal.m,"loo")
+
+compare_result = loo_compare(weib_m,logn_m)
+print(compare_result, simplify = F,digits = 2) # choose weibull
+```
+
+As a sanity check, we compared the models using `loo_compare` and determined that the Weibull model is superior for the following reasons. The **elpd_loo** metric measures the average predictive accuracy of the posterior distribution using leave one out cross validation. Based on the **elpd_diff**, the lognormal model is more negative by –6133, which indicates that the Weibull model provides better overall predictive performance.
+
+Therefore, we can conclude that the Weibull model is the better choice. The lognormal model not only exhibits a higher standard error implying greater uncertainty and worse predictive reliability but also has a larger effective number of parameters (p_loo), suggesting it is more prone to overfitting compared to the Weibull model.
+
+```{r}
+# prior
+prior_summary(weibull.m)
+prior_dist = posterior_predict(weibull.m,sample_prior = "only",ndraws = 100)
+hist(prior_dist[1, ], breaks = 50, main = "Prior Predictive RUL (1st draw)",
+     xlab = "RUL", col = "skyblue") # model the predictability of the RUL distribution for this first prior world that we sampled out of 100
+```
+
+For the prior analysis, we generated 100 prior worlds, each producing RUL predictions under a Weibull AFT model with parameters sampled solely from the priors. This allows us to assess whether the RUL distribution implied by the prior parameters of the Weibull AFT model is reasonable before incorporating the actual data.
+
+```{r}
+# posterior & prior analysis
+prior_draws = prior_samples(weibull.m) %>% mutate(source = "prior")
+post_draws  =  posterior_samples(weibull.m, pars = "shape") %>% mutate(source = "posterior")
+post_prior.draws = bind_rows(prior_draws,post_draws)
+ggplot(post_prior.draws, aes(x = shape, fill = source, color = source)) +
+  geom_density(alpha = 0.3) +
+  labs(title = "Prior vs Posterior: Shape parameter") # data is more informative that it shrunk the variance 
+```
+
+For this posterior analysis, we compared the shape parameter to assess how much the data (likelihood) influenced the posterior. If the prior and posterior distributions looked nearly identical, it would suggest that the data had little to no influence. However, in this case, the posterior distribution differs significantly from the prior, indicating that the data had a strong influence and substantially shifted the shape parameter.
+
+\newpage
+
+### Weibull Model Fit for Training
+
+```{r}
+train_engines = fleet1_pca %>% group_by(engine_id) %>% slice_max(order_by = cycles, n = 1) %>% ungroup()
+draws_train = posterior_predict(weibull.m,train_engines %>% dplyr::select(cycles, PC1:PC5),ndraws = 4000)
+
+# evaluation metric
+rul_mean = colMeans(draws_train)
+quantile(rul_mean, c(.025,.5,.975))
+
+RUL.summary = apply(draws_train, 2, function(x) {
+  c(
+    mean = mean(x), 
+    q2.5 = quantile(x, 0.025),
+    q50  = quantile(x, 0.5),
+    q97.5= quantile(x, 0.975)
+  )
+})
+
+RUL.summary = as.data.frame(t(RUL.summary))
+RUL.summary$engine_id = unique(train_engines$engine_id)
+RUL.summary$RUL = 0
+RUL.summary$abs_error = abs(RUL.summary$mean - RUL.summary$RUL)
+mean(RUL.summary$abs_error)
+head(RUL.summary)
+
+colMeans(draws_train <= 5) * 100 # p of a failing engine within 5 cycles of RUL
+summary(colMeans(draws_train <= 5))
+
+# test RUL not at 0, but mid cycle to see RUL.
+train_engines_sample = fleet1_pca %>% group_by(engine_id) %>% slice_sample(n = 3)
+
+draws_train_sample = posterior_predict(weibull.m,train_engines_sample[,-c(1,3)],ndraws = 2000)
+rul_sample = colMeans(draws_train_sample)
+rul_true_sample = ifelse(train_engines_sample$RUL == 0, 0.01, train_engines_sample$RUL)
+MAE_sample = mean(abs(rul_true_sample - rul_sample))
+
+train_df.res = data.frame(engine_id = train_engines_sample$engine_id,rul_mean = rul_sample, true_rul = train_engines_sample$RUL)
+head(train_df.res)
+```
+
+Based on our results, the trained model achieved a mean absolute error (MAE) of 14 when predicting RUL at the end of life. This indicates some variation across engines. For example, for engine 1, where each engine had 4000 posterior draws, the model predicted a mean RUL of 26 cycles, while the actual RUL was 0. The 95% credible interval for this prediction was (6.45, 51.8) cycles. We repeated this process for all 99 other engines.
+
+We also tested predictions at random midpoints in the engine life cycle rather than only at failure (RUL = 0). In this case, the MAE increased to 30.16, reflecting the added difficulty of predicting RUL at intermediate stages.
+
+### Test data to validate
+
+```{r}
+sum(is.na(fleet1.t))
+fleet1.t = fleet1.t %>% select(!c("sensor18","sensor19"))
+
+max_cycles = fleet1.t %>% group_by(engine_id) %>% summarise(max_cycle = max(cycles))
+fleet1.t = fleet1.t %>% left_join(max_cycles, by = "engine_id") %>% mutate(RUL = max_cycle - cycles)
+
+PC_test = as.data.frame(predict(res.pca, newdata = fleet1.t[, -c(1:5,25,26)])[, 1:5, drop = FALSE])
+
+test_pca = bind_cols(
+  fleet1.t %>% select(engine_id, cycles, RUL),
+  PC_test
+)
+
+test_pca = test_pca %>% group_by(engine_id) %>% slice_max(order_by = cycles, n = 1) %>% ungroup()
+
+truth = read.table("/Users/everestyoung/Desktop/Projects/RUL Turbofan/Bayesian Analysis/CMAPSSData/RUL_FD001.txt", col.names = "RUL_true")
+truth$engine_id = seq(nrow(truth))
+
+draws_test = posterior_predict(weibull.m,test_pca[,-c(1,3)],ndraws = 4000)
+
+# evaluation metric
+pred_mean_test = colMeans(draws_test)
+pred_median_test = apply(draws_test,2,median) 
+pred_q_test = apply(draws_test, 2, quantile, c(.025,.975))
+rul_mean.test = colMeans(draws_test)
+quantile(rul_mean.test, c(.025,.5,.975))
+
+# Proper coverage: DOES TRUTH FALL INSIDE [2.5%, 97.5%]?
+coverage95 = mean(truth$RUL_true >= pred_q_test[1,] & truth$RUL_true <= pred_q_test[2,])
+PIwidth95  = mean(pred_q_test[2,] - pred_q_test[1,])
+
+MAE = mean(abs(truth$RUL_true - pred_mean_test))
+MAE
+
+sum(colMeans(draws_test <= 30) >=0.50)
+
+test.plot.df = data.frame(engine_id = test_pca$engine_id,true_rul = truth$RUL_true, rul_med = pred_median_test,conf_25 = pred_q_test[1,], rul_mean = pred_mean_test, conf_975 = pred_q_test[2,])
+head(test.plot.df)
+```
+
+Based on our results, the model achieved a mean absolute error (MAE) of 23 when predicting the RUL of the test data. This indicates differences across engines between the posterior RUL predictions and the actual RUL values. For example, for engine 1, where each engine had 4000 posterior draws, the model predicted a mean RUL of 180 cycles, while the actual RUL was 112 cycles. The 95% credible interval for this prediction was (176.4, 181) cycles. We repeated this process for all 99 other engines.
+
+We also tested how likely engines were to reach specific RUL thresholds. For instance, when asking how many engines had RUL \<= 30 cycles, the model identified 14 engines with at least a 50% probability of failure within that range.
+
+```{r}
+# test data - credible interval plots
+ggplot(test.plot.df, mapping = aes(x = factor(engine_id), y = true_rul)) + geom_point(aes(y = rul_mean, color = "red")) + geom_point(aes(y = true_rul, color = "blue")) + scale_color_manual(labels = c("Mean RUL", "True RUL"),values = c("red","blue")) + geom_errorbar(aes(ymin = conf_25, ymax = conf_975)) + theme_bw() + theme(axis.text.x = element_text(angle = 45)) + xlab("Engine ID") + ylab("RUL")
+```
+
+Based on the interval plot, we can see that many engines have wide interval bands. Narrower intervals indicate higher confidence and precision in predicting the cycle at which an engine will fail. Overall, 95% of the RUL estimates across engines fall within the true RUL cycle.
+
+\newpage
+
+**Result/Conclusion/Interpretation**:
+
+Our analysis applied a Bayesian Weibull AFT survival model to the CMAPSS FD001 turbofan engine dataset, using PCA reduced sensor inputs (PC1–PC5) as covariates. The Bayesian framework allowed us to incorporate informative priors, obtain posterior distributions for all parameters, and quantify uncertainty in Remaining Useful Life (RUL) predictions through credible intervals.
+
+**Model fit and convergence**
+
+\* All MCMC diagnostics were satisfactory: $\hat{R} = 1.00$ for all parameters and very large effective sample sizes (bulk and tail ESS), indicating stable, well‐mixed chains.
+
+-   The posterior for the Weibull shape parameter ($k \approx 2.43$) was sharply peaked, suggesting high certainty that engines follow a wear‐out regime with increasing hazard over time.
+
+-   Covariate effects were interpretable as time ratios: PC1 and PC3 extended lifetime (\~+23% and +18% per unit increase), while PC4 slightly reduced it (–3%). PC2 was weakly informed and could be dropped for parsimony.
+
+**Model comparison** We compared Weibull and lognormal AFT models using leave‐one‐out cross‐validation (LOO):
+
+-   Weibull: elpd_loo = –103,545, looic = 207,090, p_loo ≈ 8.4
+
+-   Lognormal: elpd_loo = –109,679, looic = 219,358, p_loo ≈ 72
+
+-   The elpd_diff = –6134 ± 341 strongly favored the Weibull model, which not only achieved substantially better predictive accuracy but also did so with far fewer effective parameters. This confirms that Weibull is both more parsimonious and better aligned with the physics of engine degradation.
+
+**Predictive accuracy**
+
+On training engines, the model achieved a mean absolute error (MAE) of \~14 cycles at end‐of‐life, and \~30 cycles when predicting at random midpoints.
+
+On test engines, the MAE was \~23 cycles, with \~95% coverage of the true RUL within the 95% posterior credible intervals.
+
+Credible intervals were sometimes wide, reflecting appropriate uncertainty quantification. Engines with narrower posterior intervals corresponded to cases where the model was more confident about failure time.
+
+For decision support, queries such as “What is the probability this engine fails within 30 cycles?” can be directly answered: e.g., 14 engines were identified with ≥50% probability of failing within 30 cycles.
+
+**Conclusion** The Bayesian Weibull AFT model provides a reliable and interpretable framework for turbofan RUL prediction. Compared to lognormal alternatives, it delivers superior predictive performance, fewer effective parameters, and direct engineering interpretability through the shape parameter and covariate time ratios. The model not only predicts RUL point estimates but also delivers full predictive distributions, enabling risk‐aware decision making critical for safety‐critical aerospace applications.
